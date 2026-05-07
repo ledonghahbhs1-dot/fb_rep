@@ -15,7 +15,9 @@ import time
 import sys
 from urllib.parse import unquote
 
-API_BASE = "http://localhost:3001/api"
+# Local (Replit dev):  http://localhost:3001/api
+# Railway production:  https://reportfb.up.railway.app/api
+API_BASE = "https://reportfb.up.railway.app/api"
 
 
 def build_cookie_string(c_user: str, xs: str, datr: str = "", fr: str = "", sb: str = "") -> str:
