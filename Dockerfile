@@ -6,7 +6,7 @@ RUN npm install -g pnpm@10
 WORKDIR /app
 
 # Copy workspace manifests for dependency install layer caching
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY package.json pnpm-workspace.yaml ./
 
 # Copy all package.json files so pnpm can resolve the workspace graph
 COPY lib/api-spec/package.json ./lib/api-spec/
