@@ -14,6 +14,8 @@ export interface ReportJob {
   status: "running" | "completed" | "failed";
   total: number;
   done: number;
+  reportedCount: number;
+  failedCount: number;
   results: ReportResult[];
   startedAt: string;
   finishedAt?: string;
