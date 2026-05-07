@@ -16,6 +16,7 @@ COPY lib/db/package.json ./lib/db/
 COPY scripts/package.json ./scripts/
 COPY artifacts/api-server/package.json ./artifacts/api-server/
 COPY artifacts/fb-bot-dashboard/package.json ./artifacts/fb-bot-dashboard/
+COPY artifacts/fb-reporter-api/package.json ./artifacts/fb-reporter-api/
 
 # Install all workspace dependencies
 RUN pnpm install --no-frozen-lockfile
