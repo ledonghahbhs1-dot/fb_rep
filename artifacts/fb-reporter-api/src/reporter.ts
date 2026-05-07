@@ -23,6 +23,8 @@ export interface ReportJob {
   status: "running" | "completed" | "failed";
   total: number;
   done: number;
+  reportedCount: number;
+  failedCount: number;
   results: ReportResult[];
   startedAt: string;
   finishedAt?: string;
@@ -35,7 +37,7 @@ const CHROMIUM_PATH: string | undefined =
     ? "/nix/store/0n9rl5l9syy808xi9bk4f6dhnfrvhkww-playwright-browsers-chromium/chromium-1080/chrome-linux/chrome"
     : undefined);
 
-function parseCookies(raw: string): Array<{ name: string; value: string; domain: string; path: string }> {
+function parseCookies(raw: string): Array<{ name: string; value: string; domain: string; path: string; secure: boolean }> {
   return raw
     .split(";")
     .map((p) => p.trim())
@@ -43,8 +45,8 @@ function parseCookies(raw: string): Array<{ name: string; value: string; domain:
     .map((pair) => {
       const idx = pair.indexOf("=");
       const name = idx > -1 ? pair.slice(0, idx).trim() : pair.trim();
-      const value = idx > -1 ? pair.slice(idx + 1).trim() : "";
-      return { name, value, domain: ".facebook.com", path: "/" };
+      const value = idx > -1 ? decodeURIComponent(pair.slice(idx + 1).trim()) : "";
+      return { name, value, domain: ".facebook.com", path: "/", secure: true };
     });
 }
 
@@ -55,62 +57,150 @@ async function reportProfile(
 ): Promise<{ success: boolean; message: string }> {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
 
-    const moreBtn = page.locator('[aria-label="More"], [data-testid="profileMoreMenuButton"]').first();
-    if (!(await moreBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
-      return { success: false, message: "Could not find profile actions button" };
-    }
-    await moreBtn.click();
-    await page.waitForTimeout(1000);
+    // Try to find the "More" / "..." button on the profile
+    // Facebook uses different selectors depending on version/language
+    const moreBtnSelectors = [
+      '[aria-label="More"]',
+      '[aria-label="Thêm"]',
+      '[data-testid="profileMoreMenuButton"]',
+      'div[role="button"]:has([d*="M12 3c-1.2"])',  // three-dot SVG path
+      'div[role="button"][aria-haspopup="menu"]',
+      // Mobile/responsive version
+      '[aria-label="See options"]',
+    ];
 
-    const reportItem = page.locator('text=Report profile, text=Report, [role="menuitem"]:has-text("Report")').first();
-    if (!(await reportItem.isVisible({ timeout: 5000 }).catch(() => false))) {
-      return { success: false, message: "Could not find Report option in menu" };
-    }
-    await reportItem.click();
-    await page.waitForTimeout(1500);
-
-    const reasonMap: Record<ReportReason, string[]> = {
-      fake: ["Fake account", "It's pretending to be someone", "This is a fake account"],
-      impersonating: ["Pretending to be someone", "It's pretending to be me", "Impersonation"],
-      spam: ["Spam", "Posting spam"],
-      pretending: ["Pretending to be someone", "It's pretending to be someone else"],
-    };
-
-    const labels = reasonMap[reason];
-    let clicked = false;
-    for (const label of labels) {
-      const opt = page.locator(`text="${label}"`).first();
-      if (await opt.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await opt.click();
-        clicked = true;
+    let moreBtnClicked = false;
+    for (const sel of moreBtnSelectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await btn.click();
+        moreBtnClicked = true;
+        await page.waitForTimeout(1200);
         break;
       }
     }
 
-    if (!clicked) {
-      const anyOption = page.locator('[role="radio"], [role="option"]').first();
-      if (await anyOption.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await anyOption.click();
-        clicked = true;
+    if (!moreBtnClicked) {
+      // Try clicking any visible 3-dot / options button near the profile cover
+      const fallbackBtn = page.locator('[role="button"]:has(svg)').filter({ hasText: "" }).nth(2);
+      if (await fallbackBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await fallbackBtn.click();
+        moreBtnClicked = true;
+        await page.waitForTimeout(1200);
       }
     }
 
-    if (!clicked) {
-      return { success: false, message: "Could not select report reason" };
+    if (!moreBtnClicked) {
+      return { success: false, message: "Could not find profile options button (More/...)" };
     }
 
-    await page.waitForTimeout(1000);
+    // Find and click the Report option in the dropdown menu
+    const reportSelectors = [
+      '[role="menuitem"]:has-text("Report")',
+      '[role="menuitem"]:has-text("Báo cáo")',
+      'a:has-text("Report profile")',
+      'div:has-text("Report profile"):not([role="none"])',
+      'span:text-is("Report profile")',
+      'span:text-is("Report")',
+    ];
 
-    const nextBtn = page.locator('div[role="button"]:has-text("Next"), button:has-text("Next"), div[role="button"]:has-text("Submit"), button:has-text("Submit")').first();
-    if (await nextBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await nextBtn.click();
-      await page.waitForTimeout(1500);
+    let reportClicked = false;
+    for (const sel of reportSelectors) {
+      const item = page.locator(sel).first();
+      if (await item.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await item.click();
+        reportClicked = true;
+        await page.waitForTimeout(2000);
+        break;
+      }
     }
 
-    const doneBtn = page.locator('div[role="button"]:has-text("Done"), button:has-text("Done"), div[role="button"]:has-text("Close"), button:has-text("Close")').first();
-    if (await doneBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (!reportClicked) {
+      return { success: false, message: "Could not find Report option in menu" };
+    }
+
+    // Map reason to possible label texts Facebook shows in the report dialog
+    const reasonLabels: Record<ReportReason, string[]> = {
+      fake: [
+        "Fake account",
+        "It\u2019s pretending to be someone",
+        "This is a fake account",
+        "Pretending to be someone",
+        "T\u00e0i kho\u1ea3n gi\u1ea3",
+      ],
+      impersonating: [
+        "It\u2019s pretending to be me",
+        "Impersonating someone",
+        "Pretending to be someone",
+        "M\u1ea1o danh ai \u0111\u00f3",
+      ],
+      spam: ["Spam", "Posting spam", "It\u2019s spam", "Spam t\u00e0i kho\u1ea3n"],
+      pretending: [
+        "It\u2019s pretending to be someone else",
+        "Pretending to be someone",
+        "Gi\u1ea3 v\u1edd l\u00e0 ng\u01b0\u1eddi kh\u00e1c",
+      ],
+    };
+
+    const labels = reasonLabels[reason];
+    let reasonClicked = false;
+
+    for (const label of labels) {
+      const opt = page.locator(`text="${label}"`).first();
+      if (await opt.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await opt.click();
+        reasonClicked = true;
+        await page.waitForTimeout(1000);
+        break;
+      }
+    }
+
+    // Fallback: click the first radio/option available
+    if (!reasonClicked) {
+      const firstOption = page.locator('[role="radio"], [type="radio"], [role="option"]').first();
+      if (await firstOption.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await firstOption.click();
+        reasonClicked = true;
+        await page.waitForTimeout(1000);
+      }
+    }
+
+    if (!reasonClicked) {
+      return { success: false, message: "Could not select report reason in dialog" };
+    }
+
+    // Click Next / Submit button (may need multiple Next clicks)
+    for (let step = 0; step < 4; step++) {
+      const nextBtn = page.locator([
+        'div[role="button"]:has-text("Next")',
+        'button:has-text("Next")',
+        'div[role="button"]:has-text("Submit")',
+        'button:has-text("Submit")',
+        'div[role="button"]:has-text("Tiếp")',
+        'div[role="button"]:has-text("Gửi")',
+      ].join(", ")).first();
+
+      if (await nextBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await nextBtn.click();
+        await page.waitForTimeout(1500);
+      } else {
+        break;
+      }
+    }
+
+    // Click Done / Close to finish
+    const doneBtn = page.locator([
+      'div[role="button"]:has-text("Done")',
+      'button:has-text("Done")',
+      'div[role="button"]:has-text("Close")',
+      'button:has-text("Close")',
+      'div[role="button"]:has-text("Xong")',
+      '[aria-label="Close"]',
+    ].join(", ")).first();
+
+    if (await doneBtn.isVisible({ timeout: 4000 }).catch(() => false)) {
       await doneBtn.click();
     }
 
@@ -118,6 +208,11 @@ async function reportProfile(
   } catch (err: any) {
     return { success: false, message: String(err?.message ?? err) };
   }
+}
+
+function countResults(job: ReportJob): void {
+  job.reportedCount = job.results.filter((r) => r.status === "success").length;
+  job.failedCount = job.results.filter((r) => r.status === "failed").length;
 }
 
 export class ReportEngine {
@@ -129,6 +224,8 @@ export class ReportEngine {
       status: "running",
       total: options.profileUrls.length,
       done: 0,
+      reportedCount: 0,
+      failedCount: 0,
       results: options.profileUrls.map((url) => ({ url, status: "pending" })),
       startedAt: new Date().toISOString(),
     };
@@ -137,6 +234,7 @@ export class ReportEngine {
       job.status = "failed";
       job.error = String(err);
       job.finishedAt = new Date().toISOString();
+      countResults(job);
     });
   }
 
@@ -148,7 +246,12 @@ export class ReportEngine {
       browser = await chromium.launch({
         headless: true,
         executablePath: CHROMIUM_PATH,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-blink-features=AutomationControlled",
+        ],
       });
 
       const cookies = parseCookies(options.cookies);
@@ -156,13 +259,44 @@ export class ReportEngine {
         userAgent:
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         locale: "en-US",
+        extraHTTPHeaders: {
+          "Accept-Language": "en-US,en;q=0.9",
+        },
       });
       await ctx.addCookies(cookies);
 
       const page = await ctx.newPage();
 
+      // Hide webdriver flag
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      });
+
       await page.goto("https://www.facebook.com", { waitUntil: "domcontentloaded", timeout: 30000 });
-      const isLoggedIn = await page.locator('[aria-label="Your profile"], [data-testid="blue_bar_profile_link"]').first().isVisible({ timeout: 8000 }).catch(() => false);
+      await page.waitForTimeout(3000);
+
+      // Check login by looking for elements that only appear when logged in
+      const loginSelectors = [
+        '[aria-label="Your profile"]',
+        '[data-testid="blue_bar_profile_link"]',
+        'a[href*="/me/"]',
+        '[aria-label="Facebook"]', // top nav only shown when logged in with full nav
+        'div[role="navigation"] a[href*="profile"]',
+      ];
+
+      let isLoggedIn = false;
+      for (const sel of loginSelectors) {
+        if (await page.locator(sel).first().isVisible({ timeout: 3000 }).catch(() => false)) {
+          isLoggedIn = true;
+          break;
+        }
+      }
+
+      // Secondary check: URL should not be /login
+      if (!isLoggedIn) {
+        const currentUrl = page.url();
+        isLoggedIn = !currentUrl.includes("/login") && !currentUrl.includes("checkpoint");
+      }
 
       if (!isLoggedIn) {
         for (const result of job.results) {
@@ -173,24 +307,35 @@ export class ReportEngine {
         job.status = "failed";
         job.error = "Invalid or expired Facebook cookies";
         job.finishedAt = new Date().toISOString();
+        countResults(job);
         return;
       }
 
+      logger.info({ jobId: job.jobId }, "Login verified, starting reports");
+
       for (let i = 0; i < job.results.length; i++) {
         const result = job.results[i];
-        logger.info({ url: result.url, jobId: job.jobId }, "Reporting profile");
+        logger.info({ url: result.url, jobId: job.jobId, idx: i + 1 }, "Reporting profile");
+
         const { success, message } = await reportProfile(page, result.url, options.reason);
         result.status = success ? "success" : "failed";
         result.message = message;
         result.timestamp = new Date().toISOString();
         job.done = i + 1;
+        countResults(job);
+
+        logger.info({ url: result.url, success, message }, "Report result");
+
+        // Delay between reports to avoid rate limiting
         if (i < job.results.length - 1) {
-          await page.waitForTimeout(3000 + Math.random() * 2000);
+          const delay = 4000 + Math.random() * 3000;
+          await page.waitForTimeout(delay);
         }
       }
 
       job.status = "completed";
       job.finishedAt = new Date().toISOString();
+      countResults(job);
     } finally {
       await ctx?.close().catch(() => {});
       await browser?.close().catch(() => {});
