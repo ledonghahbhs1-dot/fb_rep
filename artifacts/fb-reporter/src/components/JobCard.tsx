@@ -18,8 +18,8 @@ export function JobCard({ job: initialJob, onDelete }: Props) {
   });
 
   const progress = job.total > 0 ? Math.round((job.done / job.total) * 100) : 0;
-  const successCount = job.results.filter((r) => r.status === "success").length;
-  const failedCount = job.results.filter((r) => r.status === "failed").length;
+  const successCount = job.reportedCount ?? job.results.filter((r) => r.status === "success").length;
+  const failedCount = job.failedCount ?? job.results.filter((r) => r.status === "failed").length;
 
   const statusColor = {
     running: "bg-blue-100 text-blue-700",
