@@ -2,11 +2,21 @@ export const API_BASE = "/api";
 
 export type ReportReason = "fake" | "impersonating" | "spam" | "pretending";
 
+export interface FormResult {
+  formId: string;
+  label: string;
+  success: boolean;
+  message: string;
+}
+
 export interface ReportResult {
   url: string;
   status: "pending" | "success" | "failed" | "skipped";
   message?: string;
   timestamp?: string;
+  formResults?: FormResult[];
+  formsSubmitted?: number;
+  formsFailed?: number;
 }
 
 export interface ReportJob {
