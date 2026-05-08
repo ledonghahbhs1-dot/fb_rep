@@ -43,9 +43,8 @@ const CHROMIUM_PATH: string | undefined =
     ? "/nix/store/0n9rl5l9syy808xi9bk4f6dhnfrvhkww-playwright-browsers-chromium/chromium-1080/chrome-linux/chrome"
     : undefined);
 
-function parseCookies(raw: string): Array<{
-  name: string; value: string; domain: string; path: string; secure: boolean;
-}> {
+// ─── Cookie parser ─────────────────────────────────────────────────────────────
+function parseCookies(raw: string) {
   return raw
     .split(";")
     .map((p) => p.trim())
@@ -60,9 +59,10 @@ function parseCookies(raw: string): Array<{
     });
 }
 
-async function screenshot(page: Page, label: string): Promise<string> {
+async function dbgScreenshot(page: Page, label: string): Promise<string> {
   const file = path.join(SCREENSHOT_DIR, `${Date.now()}-${label.replace(/\W+/g, "_")}.png`);
-  await page.screenshot({ path: file, fullPage: false }).catch(() => {});
+  await page.screenshot({ path: file, fullPage: true }).catch(() => {});
+  logger.info({ file }, "Screenshot saved");
   return file;
 }
 
@@ -70,326 +70,381 @@ function extractUsername(url: string): string {
   return url.replace(/\/$/, "").split("/").pop() ?? "";
 }
 
-// ─── Strategy 1: mbasic.facebook.com (simple HTML, no JS-heavy UI) ───────────
-async function reportViaMbasic(
-  page: Page,
-  url: string,
-  reason: ReportReason
-): Promise<{ success: boolean; message: string; screenshot?: string }> {
-  try {
-    const username = extractUsername(url);
-    const mbasicUrl = `https://mbasic.facebook.com/${username}`;
-    logger.info({ url: mbasicUrl }, "[mbasic] Navigating");
-
-    await page.goto(mbasicUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(2000);
-
-    // Check we're on the right profile (not redirected to login)
-    const currentUrl = page.url();
-    if (currentUrl.includes("login") || currentUrl.includes("checkpoint")) {
-      return { success: false, message: "mbasic: redirected to login" };
+// ─── Extract numeric user-ID from any FB page ──────────────────────────────────
+async function extractUserId(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    // 1. From any href with content_id= or profile_id= or id= (numeric)
+    const allLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
+    for (const a of allLinks) {
+      const href = a.getAttribute("href") ?? "";
+      const m = href.match(/content_id=(\d{5,})/) ??
+                href.match(/profile_id=(\d{5,})/) ??
+                href.match(/[?&]id=(\d{5,})/);
+      if (m) return m[1];
     }
-
-    // Look for any "Report" link on the mbasic profile page
-    // mbasic shows a "Report" or "Report this profile" link near the bottom
-    const reportLink = page.locator([
-      'a[href*="/report/"]',
-      'a:has-text("Report")',
-      'a:has-text("Báo cáo")',
-      'a[href*="report_type"]',
-    ].join(", ")).first();
-
-    if (!await reportLink.isVisible({ timeout: 5000 }).catch(() => false)) {
-      // Try scrolling to find it
-      await page.keyboard.press("End");
-      await page.waitForTimeout(1000);
+    // 2. From form actions
+    for (const form of Array.from(document.querySelectorAll<HTMLFormElement>("form"))) {
+      const m = (form.action ?? "").match(/profile_id=(\d{5,})/) ??
+                (form.action ?? "").match(/[?&]id=(\d{5,})/);
+      if (m) return m[1];
     }
-
-    if (!await reportLink.isVisible({ timeout: 3000 }).catch(() => false)) {
-      const shot = await screenshot(page, "mbasic_no_report_link");
-      return { success: false, message: "mbasic: no Report link found on profile", screenshot: shot };
+    // 3. From <meta> al:ios:url content="fb://profile/123456"
+    const metaIos = document.querySelector<HTMLMetaElement>('meta[property="al:ios:url"]');
+    const m1 = metaIos?.content?.match(/profile\/(\d{5,})/);
+    if (m1) return m1[1];
+    // 4. From inline JSON blobs in <script>
+    const scripts = Array.from(document.querySelectorAll("script"));
+    for (const s of scripts) {
+      const t = s.textContent ?? "";
+      const m = t.match(/"userID"\s*:\s*"(\d{5,})"/) ??
+                t.match(/"entity_id"\s*:\s*"(\d{5,})"/) ??
+                t.match(/"profile_id"\s*:\s*"(\d{5,})"/);
+      if (m) return m[1];
     }
-
-    const href = await reportLink.getAttribute("href").catch(() => "");
-    logger.info({ href }, "[mbasic] Found report link");
-    await reportLink.click();
-    await page.waitForTimeout(2000);
-
-    // Now on the report form — select reason radio button
-    const reasonTextMap: Record<ReportReason, string[]> = {
-      fake: ["fake", "It's a fake account", "Fake account", "pretending to be"],
-      impersonating: ["impersonat", "pretending to be me", "Pretending to be"],
-      spam: ["spam", "Spam", "shouldn't be on Facebook"],
-      pretending: ["pretending to be someone", "Pretending", "fake"],
-    };
-
-    const terms = reasonTextMap[reason];
-    let radioClicked = false;
-
-    // Try to find and click a radio button matching the reason
-    for (const term of terms) {
-      const radio = page.locator(`input[type="radio"]`).filter({
-        has: page.locator(`..`).filter({ hasText: new RegExp(term, "i") }),
-      }).first();
-
-      if (await radio.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await radio.click();
-        radioClicked = true;
-        break;
-      }
-
-      // Also try label text approach
-      const label = page.locator(`label:has-text("${term}")`).first();
-      if (await label.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await label.click();
-        radioClicked = true;
-        break;
-      }
-    }
-
-    // Fallback: click the first radio available
-    if (!radioClicked) {
-      const firstRadio = page.locator('input[type="radio"]').first();
-      if (await firstRadio.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await firstRadio.click();
-        radioClicked = true;
-      }
-    }
-
-    if (!radioClicked) {
-      const shot = await screenshot(page, "mbasic_no_radio");
-      return { success: false, message: "mbasic: could not select report reason", screenshot: shot };
-    }
-
-    // Submit the form
-    const submitBtn = page.locator([
-      'input[type="submit"]',
-      'button[type="submit"]',
-      'button:has-text("Continue")',
-      'button:has-text("Submit")',
-      'input[value="Continue"]',
-      'input[value="Submit"]',
-      'input[value="Tiếp tục"]',
-    ].join(", ")).first();
-
-    if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await submitBtn.click();
-      await page.waitForTimeout(2000);
-    }
-
-    // Check for success indicators on the confirmation page
-    const currentUrlAfter = page.url();
-    if (
-      currentUrlAfter.includes("report") ||
-      currentUrlAfter !== mbasicUrl
-    ) {
-      return { success: true, message: "Report submitted via mbasic" };
-    }
-
-    return { success: true, message: "Report submitted via mbasic (form submitted)" };
-
-  } catch (err: any) {
-    return { success: false, message: `mbasic error: ${err?.message ?? err}` };
-  }
+    // 5. From the URL itself if already numeric
+    const pm = location.pathname.match(/^\/(\d{5,})\/?$/);
+    if (pm) return pm[1];
+    return null;
+  });
 }
 
-// ─── Strategy 2: www.facebook.com via 3-dot "More" button ────────────────────
-async function reportViaDesktop(
+// ─── Reason mapping ────────────────────────────────────────────────────────────
+// Map our reason codes → mbasic crep param and radio-text fallbacks
+const REASON_CREP: Record<ReportReason, string> = {
+  fake:          "0",   // fake account
+  impersonating: "1",   // impersonation
+  spam:          "2",   // spam
+  pretending:    "0",   // same as fake
+};
+
+const REASON_RADIO_TEXTS: Record<ReportReason, string[]> = {
+  fake:          ["Fake account", "It\u2019s a fake account", "T\u00e0i kho\u1ea3n gi\u1ea3", "Pretending to be"],
+  impersonating: ["Pretending to be me", "It\u2019s pretending to be me", "Impersonat", "M\u1ea1o danh"],
+  spam:          ["Spam", "It\u2019s spam", "Spam t\u00e0i kho\u1ea3n", "shouldn\u2019t be on Facebook"],
+  pretending:    ["Pretending to be someone", "It\u2019s pretending to be", "Gi\u1ea3 v\u1edd"],
+};
+
+// ─── Submit a simple HTML form page (mbasic-style) ─────────────────────────────
+async function submitMbasicForm(page: Page, reason: ReportReason): Promise<{ success: boolean; message: string }> {
+  const texts = REASON_RADIO_TEXTS[reason];
+
+  // Try to select a radio button matching the reason
+  let selected = false;
+  for (const text of texts) {
+    // Try label with matching text
+    const label = page.locator(`label`).filter({ hasText: new RegExp(text, "i") }).first();
+    if (await label.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await label.click();
+      selected = true;
+      break;
+    }
+    // Try radio whose sibling/parent text matches
+    const radio = page.locator(`input[type="radio"]`).filter({
+      has: page.locator(`xpath=..`).filter({ hasText: new RegExp(text, "i") }),
+    }).first();
+    if (await radio.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await radio.click();
+      selected = true;
+      break;
+    }
+  }
+
+  // Fallback: click first available radio
+  if (!selected) {
+    const first = page.locator(`input[type="radio"]`).first();
+    if (await first.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await first.click();
+      selected = true;
+    }
+  }
+
+  if (!selected) {
+    const shot = await dbgScreenshot(page, "mbasic_form_no_radio");
+    return { success: false, message: `No radio buttons found on report form (screenshot: ${shot})` };
+  }
+
+  await page.waitForTimeout(500);
+
+  // Submit
+  const submitSel = [
+    'input[type="submit"]',
+    'button[type="submit"]',
+    'input[value="Continue"]',
+    'input[value="Tiếp tục"]',
+    'input[value="Submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Submit")',
+  ].join(", ");
+
+  const submit = page.locator(submitSel).first();
+  if (!await submit.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const shot = await dbgScreenshot(page, "mbasic_form_no_submit");
+    return { success: false, message: `No submit button on report form (screenshot: ${shot})` };
+  }
+  await submit.click();
+  await page.waitForTimeout(2000);
+
+  // Handle possible multi-step form (click Continue/Submit up to 3 more times)
+  for (let step = 0; step < 3; step++) {
+    const more = page.locator(submitSel).first();
+    if (await more.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await more.click();
+      await page.waitForTimeout(1500);
+    } else break;
+  }
+
+  return { success: true, message: "Report submitted successfully via mbasic form" };
+}
+
+// ─── Strategy A: navigate directly to mbasic report URL via extracted link ────
+async function strategyDirectUrl(
   page: Page,
-  url: string,
+  profileUrl: string,
   reason: ReportReason
 ): Promise<{ success: boolean; message: string; screenshot?: string }> {
-  try {
-    logger.info({ url }, "[desktop] Navigating");
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(3000);
+  const username = extractUsername(profileUrl);
+  const mbasicProfile = `https://mbasic.facebook.com/${username}`;
 
-    // ── Click More button (the one in profile ACTIONS, NOT in navigation bar) ──
-    // Navigation bar is at y ≈ 0-60px. Profile actions row is at y ≈ 300-450px.
-    // We skip anything with y < 150 (nav bar region).
-    const moreBtnClicked = await page.evaluate(() => {
-      const candidates = Array.from(
-        document.querySelectorAll<HTMLElement>('[aria-label="More"], [aria-label="Thêm"]')
-      );
-      // Filter: must be visible, NOT in the top navigation bar (y > 150)
-      const profileAreaCandidates = candidates.filter((el) => {
-        const rect = el.getBoundingClientRect();
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          rect.top > 150 &&   // skip navigation bar
-          rect.top < 600      // must be in profile header area
-        );
-      });
+  logger.info({ url: mbasicProfile }, "[A] Loading mbasic profile");
+  await page.goto(mbasicProfile, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(2000);
 
-      if (profileAreaCandidates.length === 0) return "not_found";
+  if (page.url().includes("login") || page.url().includes("checkpoint")) {
+    return { success: false, message: "[A] Cookie invalid / redirected to login" };
+  }
 
-      // Click the one closest to the profile area (first one after nav bar)
-      profileAreaCandidates.sort((a, b) =>
-        a.getBoundingClientRect().top - b.getBoundingClientRect().top
-      );
-      profileAreaCandidates[0].click();
-      return "clicked";
-    });
+  // Scroll to bottom so all links render
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForTimeout(1000);
 
-    if (moreBtnClicked !== "clicked") {
-      // Try aria-haspopup="menu" in the profile area
-      const menuBtns = page.locator('div[role="button"][aria-haspopup="menu"]');
-      const count = await menuBtns.count().catch(() => 0);
-      let clicked = false;
-      for (let i = 0; i < count; i++) {
-        const btn = menuBtns.nth(i);
-        const box = await btn.boundingBox().catch(() => null);
-        if (box && box.y > 150 && box.y < 600) {
-          await btn.click();
-          clicked = true;
-          break;
-        }
-      }
-      if (!clicked) {
-        const shot = await screenshot(page, "desktop_no_more_btn");
-        return { success: false, message: "desktop: could not find profile More (...) button", screenshot: shot };
+  // Extract numeric user ID (needed to build direct report URL)
+  const userId = await extractUserId(page);
+  logger.info({ userId }, "[A] Extracted user ID");
+
+  // Look for a "report" href on the page (mbasic usually has one at the bottom)
+  const reportHref = await page.evaluate((): string | null => {
+    const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
+    for (const a of links) {
+      const href = a.getAttribute("href") ?? "";
+      const text = (a.textContent ?? "").trim().toLowerCase();
+      if (
+        (text === "report" || text === "báo cáo" || /^report/.test(text)) &&
+        href.length > 1
+      ) {
+        return a.href;
       }
     }
-
-    await page.waitForTimeout(1500);
-
-    // ── Click "Find support or report profile" in the dropdown ──
-    // Wait for the dropdown menu to appear
-    await page.waitForSelector('[role="menu"], [role="menuitem"]', { timeout: 4000 }).catch(() => {});
-
-    // Log all visible menuitem texts for debugging
-    const menuItems = await page.locator('[role="menuitem"]').allInnerTexts().catch(() => [] as string[]);
-    logger.info({ menuItems }, "[desktop] Visible menu items");
-
-    const reportMenuClicked = await page.evaluate(() => {
-      const items = document.querySelectorAll<HTMLElement>('[role="menuitem"]');
-      for (const item of items) {
-        const text = item.textContent ?? "";
-        if (/report|báo cáo/i.test(text)) {
-          item.click();
-          return text.trim();
-        }
+    // Any link with /report/ in href that looks like a report action
+    for (const a of links) {
+      const href = a.href ?? "";
+      if (href.includes("/report/") && (href.includes("ctype") || href.includes("content_id") || href.includes("crep"))) {
+        return href;
       }
-      return null;
-    });
-
-    if (!reportMenuClicked) {
-      const shot = await screenshot(page, "desktop_no_report_menuitem");
-      logger.warn({ menuItems }, "[desktop] Could not find report menu item");
-      return {
-        success: false,
-        message: `desktop: no report option in menu (items: ${menuItems.join(" | ")})`,
-        screenshot: shot,
-      };
     }
+    return null;
+  });
 
-    logger.info({ clicked: reportMenuClicked }, "[desktop] Clicked report menu item");
-    await page.waitForTimeout(2000);
+  // Build report URL: prefer extracted link, otherwise construct from user ID
+  let reportUrl: string | null = reportHref;
 
-    // ── Select reason in dialog ──
-    await page.waitForSelector('[role="dialog"]', { timeout: 5000 }).catch(() => {});
+  if (!reportUrl && userId) {
+    // mbasic direct report URL with user ID
+    const crep = REASON_CREP[reason];
+    reportUrl = `https://mbasic.facebook.com/report/?ctype=1&crep=${crep}&content_id=${userId}&source=profile_actions&from_untrusted=1`;
+    logger.info({ reportUrl, userId }, "[A] Constructed report URL from user ID");
+  }
 
-    const reasonLabels: Record<ReportReason, string[]> = {
-      fake: ["It\u2019s a fake account", "Fake account", "This is a fake account"],
-      impersonating: ["It\u2019s pretending to be me", "Pretending to be someone", "Impersonating"],
-      spam: ["It\u2019s posting content that shouldn\u2019t be on Facebook", "Spam", "It\u2019s spam"],
-      pretending: ["It\u2019s pretending to be someone", "Pretending to be someone else"],
+  if (!reportUrl) {
+    const shot = await dbgScreenshot(page, "A_no_report_url");
+    return { success: false, message: `[A] Could not find or construct report URL (userId=${userId})`, screenshot: shot };
+  }
+
+  logger.info({ reportUrl }, "[A] Navigating to report URL");
+  await page.goto(reportUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1500);
+
+  // Fill and submit the mbasic form
+  const result = await submitMbasicForm(page, reason);
+  return { ...result, message: result.message };
+}
+
+// ─── Strategy B: www.facebook.com with correct More button targeting ──────────
+async function strategyDesktop(
+  page: Page,
+  profileUrl: string,
+  reason: ReportReason
+): Promise<{ success: boolean; message: string; screenshot?: string }> {
+  logger.info({ url: profileUrl }, "[B] Desktop strategy");
+  await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(3000);
+
+  // Get page structure info for debugging
+  const pageInfo = await page.evaluate(() => {
+    const moreButtons = Array.from(document.querySelectorAll('[aria-label="More"], [aria-label="Thêm"]'));
+    return moreButtons.map((el) => {
+      const rect = el.getBoundingClientRect();
+      return { y: Math.round(rect.y), x: Math.round(rect.x), text: el.textContent?.slice(0, 30) };
+    });
+  });
+  logger.info({ pageInfo }, "[B] Found More buttons");
+
+  // The profile actions "More" button:
+  // - NOT in the top navigation bar (y > 150)
+  // - NOT below the fold for the header (y < 600)
+  // - Profile action buttons are roughly at y 320-430
+  const clicked = await page.evaluate(() => {
+    const candidates = Array.from(
+      document.querySelectorAll<HTMLElement>('[aria-label="More"], [aria-label="Thêm"]')
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && r.y > 150 && r.y < 600;
+    }).sort((a, b) => a.getBoundingClientRect().y - b.getBoundingClientRect().y);
+
+    if (candidates.length === 0) return false;
+    candidates[0].click();
+    return true;
+  });
+
+  if (!clicked) {
+    const shot = await dbgScreenshot(page, "B_no_more_btn");
+    return { success: false, message: "[B] No More (...) button found in profile area", screenshot: shot };
+  }
+
+  await page.waitForTimeout(1500);
+
+  // Log what appeared after click
+  const menuTexts = await page.locator('[role="menuitem"]').allInnerTexts().catch(() => [] as string[]);
+  logger.info({ menuTexts }, "[B] Menu items after clicking More");
+
+  if (menuTexts.length === 0) {
+    const shot = await dbgScreenshot(page, "B_no_menu");
+    return { success: false, message: "[B] No menu appeared after clicking More", screenshot: shot };
+  }
+
+  // Find report item (case-insensitive)
+  const reportItemClicked = await page.evaluate(() => {
+    const items = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+    for (const item of items) {
+      if (/report|báo cáo/i.test(item.textContent ?? "")) {
+        item.click();
+        return item.textContent?.trim() ?? "clicked";
+      }
+    }
+    return null;
+  });
+
+  if (!reportItemClicked) {
+    const shot = await dbgScreenshot(page, "B_no_report_in_menu");
+    return {
+      success: false,
+      message: `[B] Menu has no report item. Items: [${menuTexts.join(" | ")}]`,
+      screenshot: shot,
     };
+  }
 
-    let reasonClicked = false;
-    for (const label of reasonLabels[reason]) {
-      for (const loc of [
-        page.locator(`[role="radio"]:has-text("${label}")`).first(),
-        page.locator(`label:has-text("${label}")`).first(),
-      ]) {
-        if (await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await loc.click();
-          reasonClicked = true;
-          break;
-        }
-      }
-      if (reasonClicked) break;
-    }
+  logger.info({ item: reportItemClicked }, "[B] Clicked report menu item");
+  await page.waitForTimeout(2000);
 
-    if (!reasonClicked) {
-      const anyRadio = page.locator('[role="dialog"] [role="radio"]').first();
-      if (await anyRadio.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await anyRadio.click();
+  // ── Select reason in dialog ──
+  await page.waitForSelector('[role="dialog"]', { timeout: 5000 }).catch(() => {});
+
+  const dialogTexts = await page.locator('[role="dialog"]').allInnerTexts().catch(() => [] as string[]);
+  logger.info({ dialogTexts: dialogTexts.join(" | ").slice(0, 200) }, "[B] Dialog texts");
+
+  let reasonClicked = false;
+  for (const text of REASON_RADIO_TEXTS[reason]) {
+    for (const sel of [
+      `[role="radio"]:has-text("${text}")`,
+      `label:has-text("${text}")`,
+      `div:has-text("${text}"):not([role="none"])`,
+    ]) {
+      const el = page.locator(`[role="dialog"] ${sel}`).first();
+      if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+        await el.click();
         reasonClicked = true;
+        break;
       }
     }
-
-    if (!reasonClicked) {
-      const shot = await screenshot(page, "desktop_no_reason");
-      return { success: false, message: "desktop: could not select reason in dialog", screenshot: shot };
-    }
-
-    await page.waitForTimeout(800);
-
-    // ── Click Next / Submit up to 5 times ──
-    for (let step = 0; step < 5; step++) {
-      const nextBtn = page.locator([
-        '[role="dialog"] div[role="button"]:has-text("Next")',
-        '[role="dialog"] div[role="button"]:has-text("Submit")',
-        '[role="dialog"] div[role="button"]:has-text("Send")',
-        '[role="dialog"] div[role="button"]:has-text("Tiếp")',
-        '[role="dialog"] div[role="button"]:has-text("Gửi")',
-      ].join(", ")).first();
-      if (await nextBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await nextBtn.click();
-        await page.waitForTimeout(1500);
-      } else break;
-    }
-
-    // ── Close dialog ──
-    const doneBtn = page.locator([
-      '[role="dialog"] div[role="button"]:has-text("Done")',
-      '[role="dialog"] [aria-label="Close"]',
-      'div[role="button"]:has-text("Done")',
-      '[aria-label="Close"]',
-    ].join(", ")).first();
-    if (await doneBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await doneBtn.click();
-    }
-
-    return { success: true, message: "Report submitted via desktop" };
-
-  } catch (err: any) {
-    return { success: false, message: `desktop error: ${err?.message ?? err}` };
+    if (reasonClicked) break;
   }
+
+  if (!reasonClicked) {
+    // Fallback: first radio in dialog
+    const first = page.locator('[role="dialog"] [role="radio"]').first();
+    if (await first.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await first.click();
+      reasonClicked = true;
+    }
+  }
+
+  if (!reasonClicked) {
+    const shot = await dbgScreenshot(page, "B_no_reason");
+    return { success: false, message: "[B] Could not select reason in dialog", screenshot: shot };
+  }
+
+  await page.waitForTimeout(800);
+
+  // ── Click through Next/Submit steps ──
+  for (let step = 0; step < 6; step++) {
+    const btn = page.locator([
+      '[role="dialog"] div[role="button"]:has-text("Next")',
+      '[role="dialog"] div[role="button"]:has-text("Submit")',
+      '[role="dialog"] div[role="button"]:has-text("Send")',
+      '[role="dialog"] div[role="button"]:has-text("Continue")',
+      '[role="dialog"] div[role="button"]:has-text("Tiếp")',
+      '[role="dialog"] div[role="button"]:has-text("Gửi")',
+    ].join(", ")).first();
+
+    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      const btnText = await btn.innerText().catch(() => "");
+      logger.info({ btnText, step }, "[B] Clicking step button");
+      await btn.click();
+      await page.waitForTimeout(1500);
+    } else break;
+  }
+
+  // ── Close dialog ──
+  const done = page.locator('[role="dialog"] div[role="button"]:has-text("Done"), [aria-label="Close"]').first();
+  if (await done.isVisible({ timeout: 3000 }).catch(() => false)) await done.click();
+
+  return { success: true, message: `Report submitted via desktop (menu: "${reportItemClicked}")` };
 }
 
-// ─── Main reporter: tries mbasic first, then desktop ─────────────────────────
+// ─── Main report dispatcher ────────────────────────────────────────────────────
 async function reportProfile(
   page: Page,
   url: string,
   reason: ReportReason
 ): Promise<{ success: boolean; message: string; screenshot?: string }> {
-  // Strategy 1: mbasic (simpler, more stable)
-  const mbasicResult = await reportViaMbasic(page, url, reason);
-  if (mbasicResult.success) return mbasicResult;
+  // Strategy A: direct URL navigation via mbasic (most reliable)
+  const resultA = await strategyDirectUrl(page, url, reason);
+  if (resultA.success) {
+    logger.info({ url }, "Strategy A succeeded");
+    return resultA;
+  }
+  logger.warn({ url, msg: resultA.message }, "Strategy A failed, trying B");
 
-  logger.warn({ url, mbasicMsg: mbasicResult.message }, "mbasic failed, trying desktop");
-
-  // Strategy 2: desktop www.facebook.com
-  const desktopResult = await reportViaDesktop(page, url, reason);
-  if (desktopResult.success) return desktopResult;
-
-  logger.warn({ url, desktopMsg: desktopResult.message }, "desktop also failed");
+  // Strategy B: desktop www.facebook.com with 3-dot menu
+  const resultB = await strategyDesktop(page, url, reason);
+  if (resultB.success) {
+    logger.info({ url }, "Strategy B succeeded");
+    return resultB;
+  }
+  logger.warn({ url, msg: resultB.message }, "Both strategies failed");
 
   return {
     success: false,
-    message: `Both strategies failed. mbasic: ${mbasicResult.message} | desktop: ${desktopResult.message}`,
-    screenshot: desktopResult.screenshot ?? mbasicResult.screenshot,
+    message: `A: ${resultA.message} | B: ${resultB.message}`,
+    screenshot: resultB.screenshot ?? resultA.screenshot,
   };
 }
 
 function countResults(job: ReportJob): void {
   job.reportedCount = job.results.filter((r) => r.status === "success").length;
-  job.failedCount = job.results.filter((r) => r.status === "failed").length;
+  job.failedCount   = job.results.filter((r) => r.status === "failed").length;
 }
 
+// ─── ReportEngine ──────────────────────────────────────────────────────────────
 export class ReportEngine {
   private jobs = new Map<string, ReportJob>();
 
@@ -431,7 +486,7 @@ export class ReportEngine {
       });
 
       const cookies = parseCookies(options.cookies);
-      logger.info({ count: cookies.length, names: cookies.map((c) => c.name) }, "Parsed cookies");
+      logger.info({ names: cookies.map((c) => c.name) }, "Cookies loaded");
 
       ctx = await browser.newContext({
         userAgent:
@@ -440,64 +495,43 @@ export class ReportEngine {
         viewport: { width: 1280, height: 900 },
         extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" },
       });
-
       await ctx.addCookies(cookies);
-      const page = await ctx.newPage();
 
-      // Hide webdriver flag
+      const page = await ctx.newPage();
       await page.addInitScript(() => {
         Object.defineProperty(navigator, "webdriver", { get: () => undefined });
         // @ts-ignore
         window.chrome = { runtime: {} };
       });
 
-      // Verify login on www first
+      // ── Verify login ──
       await page.goto("https://www.facebook.com", { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(2500);
 
-      const currentUrl = page.url();
-      const redirectedToLogin = currentUrl.includes("/login") || currentUrl.includes("checkpoint");
-      let isLoggedIn = !redirectedToLogin;
-
-      if (!isLoggedIn) {
-        for (const sel of ['[aria-label="Your profile"]', '[data-testid="blue_bar_profile_link"]', 'a[href*="/me/"]']) {
-          if (await page.locator(sel).first().isVisible({ timeout: 2000 }).catch(() => false)) {
-            isLoggedIn = true;
-            break;
-          }
-        }
-      }
-
-      if (!isLoggedIn) {
-        const shot = await screenshot(page, "login_failed");
-        for (const result of job.results) {
-          result.status = "failed";
-          result.message = "Facebook login failed — invalid or expired cookies";
-          result.screenshot = shot;
-          result.timestamp = new Date().toISOString();
-        }
-        job.status = "failed";
-        job.error = "Invalid or expired Facebook cookies";
-        job.finishedAt = new Date().toISOString();
-        countResults(job);
+      const afterUrl = page.url();
+      if (afterUrl.includes("/login") || afterUrl.includes("checkpoint")) {
+        const shot = await dbgScreenshot(page, "login_failed");
+        const msg = "Invalid or expired Facebook cookies (redirected to login)";
+        for (const r of job.results) { r.status = "failed"; r.message = msg; r.screenshot = shot; r.timestamp = new Date().toISOString(); }
+        job.status = "failed"; job.error = msg; job.finishedAt = new Date().toISOString(); countResults(job);
         return;
       }
+      logger.info({ jobId: job.jobId }, "Login OK");
 
-      logger.info({ jobId: job.jobId }, "Login OK — starting reports");
-
+      // ── Process each URL ──
       for (let i = 0; i < job.results.length; i++) {
         const result = job.results[i];
-        logger.info({ url: result.url, idx: i + 1, total: job.total }, "Reporting");
+        logger.info({ url: result.url, n: `${i + 1}/${job.total}` }, "Reporting");
 
-        const { success, message, screenshot: shot } = await reportProfile(page, result.url, options.reason);
-        result.status = success ? "success" : "failed";
-        result.message = message;
-        if (shot) result.screenshot = shot;
+        const { success, message, screenshot } = await reportProfile(page, result.url, options.reason);
+        result.status    = success ? "success" : "failed";
+        result.message   = message;
+        if (screenshot) result.screenshot = screenshot;
         result.timestamp = new Date().toISOString();
         job.done = i + 1;
         countResults(job);
 
-        logger.info({ url: result.url, success, message }, "Done");
+        logger.info({ url: result.url, success, message }, "Result");
 
         if (i < job.results.length - 1) {
           await page.waitForTimeout(5000 + Math.random() * 4000);
@@ -513,17 +547,7 @@ export class ReportEngine {
     }
   }
 
-  getJob(jobId: string): ReportJob | undefined {
-    return this.jobs.get(jobId);
-  }
-
-  getAllJobs(): ReportJob[] {
-    return Array.from(this.jobs.values()).sort(
-      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
-    );
-  }
-
-  removeJob(jobId: string): void {
-    this.jobs.delete(jobId);
-  }
+  getJob(jobId: string)   { return this.jobs.get(jobId); }
+  getAllJobs()             { return [...this.jobs.values()].sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()); }
+  removeJob(jobId: string) { this.jobs.delete(jobId); }
 }
