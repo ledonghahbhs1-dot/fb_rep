@@ -7,6 +7,33 @@ const logger = pino({ level: "info" });
 const SCREENSHOT_DIR = "/tmp/fb-screenshots";
 if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
+// ─── Fake ID image for file-upload fields ────────────────────────────────────
+// A minimal valid PNG (100×60 white rectangle) used as a placeholder ID document
+const FAKE_ID_PATH = path.join("/tmp", "fake_id.png");
+(function ensureFakeId() {
+  if (fs.existsSync(FAKE_ID_PATH)) return;
+  // PNG header + IHDR (100x60 RGB) + white IDAT + IEND
+  const buf = Buffer.from(
+    "89504e470d0a1a0a" +                          // PNG signature
+    "0000000d49484452" + "00000064" + "0000003c" + // IHDR: 100x60
+    "08020000000" + "0a23a94a00000000" +
+    "4944415478da" +
+    "edce310d00200c0441eb57c64338b7c0e42900" +
+    "2e28a2880a2888a20a2888220828a208a22808" +
+    "22880a28a2280822882808a2082888220828a2" +
+    "88a2082888a2c0030000ffff" +
+    "0000000049454e44ae426082",
+    "hex"
+  ).subarray(0, 0); // fallback — write a proper tiny PNG below
+  // Build a proper 1×1 white PNG programmatically
+  const PNG_1x1_WHITE = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADklEQVQI12P4z8BQDwAEgAF/QualIQAAAABJRU5ErkJggg==",
+    "base64"
+  );
+  fs.writeFileSync(FAKE_ID_PATH, PNG_1x1_WHITE);
+  logger.info({ path: FAKE_ID_PATH }, "Fake ID placeholder created");
+})();
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 export type ReportReason   = "fake" | "impersonating" | "spam" | "pretending";
 export type AccountStatus  = "active" | "removed" | "restricted" | "unknown";
@@ -371,8 +398,12 @@ async function submitOneHelpForm(
     if (radioSelected) await page.waitForTimeout(500);
 
     // ── 2. Fill text inputs / textareas ───────────────────────────────────
-    // Fill the FIRST unfilled visible input with the profile URL,
-    // subsequent inputs get a generic description.
+    // Detect field type from placeholder/label/name and fill appropriately.
+    // Priority: URL field → profile URL | email field → placeholder email
+    //           name field → placeholder name | other → generic description
+    const PLACEHOLDER_EMAIL = "reporter@example.com";
+    const PLACEHOLDER_NAME  = "Nguyen Van A";
+
     let urlInputFilled = false;
     for (const sel of URL_INPUT_SELS) {
       const inputs = page.locator(`${sel}:visible`);
@@ -381,23 +412,78 @@ async function submitOneHelpForm(
         const input  = inputs.nth(i);
         if (!await input.isVisible({ timeout: 400 }).catch(() => false)) continue;
 
-        // Use data-testid or id as a stable key to avoid re-filling
         const inputId = await input.getAttribute("id").catch(() => "") ??
                         await input.getAttribute("data-testid").catch(() => "") ??
                         `${sel}_${i}`;
         if (filledInputIds.has(inputId)) continue;
 
         const currentVal = await input.inputValue().catch(() => "");
-        if (!currentVal) {
-          const fillValue = !urlInputFilled ? profileUrl : "Tài khoản giả mạo, vi phạm điều khoản Facebook.";
-          await input.click();
-          await input.fill(fillValue);
-          filledInputIds.add(inputId);
-          if (!urlInputFilled) {
-            urlInputFilled = true;
-            logger.info({ sel, step, fillValue: profileUrl }, "Filled URL input");
+        if (currentVal) { filledInputIds.add(inputId); continue; }
+
+        // Determine what to fill based on field hints
+        const placeholder = (await input.getAttribute("placeholder").catch(() => "") ?? "").toLowerCase();
+        const name        = (await input.getAttribute("name").catch(() => "") ?? "").toLowerCase();
+        const inputType   = (await input.getAttribute("type").catch(() => "text") ?? "text").toLowerCase();
+        const ariaLabel   = (await input.getAttribute("aria-label").catch(() => "") ?? "").toLowerCase();
+
+        // Try to find an associated label element
+        const labelText = await page.evaluate((el) => {
+          const id = el.id;
+          if (id) {
+            const lbl = document.querySelector<HTMLLabelElement>(`label[for="${id}"]`);
+            if (lbl) return lbl.textContent?.toLowerCase() ?? "";
           }
+          const parent = el.closest("label");
+          return parent ? (parent.textContent?.toLowerCase() ?? "") : "";
+        }, await input.elementHandle().catch(() => null) as any).catch(() => "") as string;
+
+        const hints = `${placeholder} ${name} ${ariaLabel} ${labelText}`;
+
+        let fillValue: string;
+        if (inputType === "email" || hints.includes("email") || hints.includes("e-mail")) {
+          fillValue = PLACEHOLDER_EMAIL;
+        } else if (
+          hints.includes("url") || hints.includes("link") || hints.includes("liên kết") ||
+          hints.includes("http") || hints.includes("profile") || hints.includes("trang cá nhân") ||
+          hints.includes("kẻ mạo danh") || hints.includes("impersonat")
+        ) {
+          fillValue = profileUrl;
+          urlInputFilled = true;
+        } else if (
+          hints.includes("name") || hints.includes("tên") || hints.includes("họ") ||
+          hints.includes("full name") || hints.includes("your name")
+        ) {
+          fillValue = PLACEHOLDER_NAME;
+        } else if (sel === "textarea" || hints.includes("additional") || hints.includes("thêm")) {
+          fillValue = "Tài khoản này vi phạm điều khoản Facebook, đang mạo danh người khác.";
+        } else if (!urlInputFilled) {
+          fillValue = profileUrl;
+          urlInputFilled = true;
+        } else {
+          fillValue = "Tài khoản giả mạo, vi phạm điều khoản Facebook.";
         }
+
+        await input.click();
+        await input.fill(fillValue);
+        filledInputIds.add(inputId);
+        logger.info({ sel, step, hint: hints.trim().slice(0, 60), fillValue: fillValue.slice(0, 60) }, "Filled input");
+      }
+    }
+
+    // ── 2.5 Handle file upload inputs ─────────────────────────────────────
+    // Some forms (e.g. impersonation) require uploading an ID document.
+    // We upload a white placeholder PNG to satisfy the required field.
+    const fileInputs = page.locator('input[type="file"]');
+    const fileCount  = await fileInputs.count().catch(() => 0);
+    for (let fi = 0; fi < fileCount; fi++) {
+      const fileInput = fileInputs.nth(fi);
+      if (!await fileInput.isVisible({ timeout: 400 }).catch(() => false)) continue;
+      try {
+        await fileInput.setInputFiles(FAKE_ID_PATH);
+        logger.info({ step, fi }, "Uploaded fake ID placeholder to file input");
+        await page.waitForTimeout(600);
+      } catch (e) {
+        logger.warn({ step, fi, err: String(e) }, "Could not upload fake ID — skipping");
       }
     }
 

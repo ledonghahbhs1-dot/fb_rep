@@ -65241,6 +65241,20 @@ import path4 from "path";
 var logger2 = (0, import_pino2.pino)({ level: "info" });
 var SCREENSHOT_DIR = "/tmp/fb-screenshots";
 if (!fs2.existsSync(SCREENSHOT_DIR)) fs2.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+var FAKE_ID_PATH = path4.join("/tmp", "fake_id.png");
+(function ensureFakeId() {
+  if (fs2.existsSync(FAKE_ID_PATH)) return;
+  const buf = Buffer.from(
+    "89504e470d0a1a0a0000000d49484452000000640000003c080200000000a23a94a000000004944415478daedce310d00200c0441eb57c64338b7c0e429002e28a2880a2888a20a2888220828a208a2280822880a28a2280822882808a2082888220828a288a2082888a2c0030000ffff0000000049454e44ae426082",
+    "hex"
+  ).subarray(0, 0);
+  const PNG_1x1_WHITE = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADklEQVQI12P4z8BQDwAEgAF/QualIQAAAABJRU5ErkJggg==",
+    "base64"
+  );
+  fs2.writeFileSync(FAKE_ID_PATH, PNG_1x1_WHITE);
+  logger2.info({ path: FAKE_ID_PATH }, "Fake ID placeholder created");
+})();
 var CHROMIUM_PATH3 = process.env.CHROMIUM_PATH ?? (process.env.REPL_ID ? "/nix/store/0n9rl5l9syy808xi9bk4f6dhnfrvhkww-playwright-browsers-chromium/chromium-1080/chrome-linux/chrome" : void 0);
 var ALL_HELP_FORMS = [
   { id: "295309487309948", label: "B\xE1o c\xE1o t\xE0i kho\u1EA3n gi\u1EA3 m\u1EA1o", reasons: ["fake", "impersonating", "pretending"] },
@@ -65396,6 +65410,8 @@ async function submitOneHelpForm(page, form, profileUrl, reason) {
       if (radioSelected) logger2.info({ step }, "Selected first available radio (fallback)");
     }
     if (radioSelected) await page.waitForTimeout(500);
+    const PLACEHOLDER_EMAIL = "reporter@example.com";
+    const PLACEHOLDER_NAME = "Nguyen Van A";
     let urlInputFilled = false;
     for (const sel of URL_INPUT_SELS) {
       const inputs = page.locator(`${sel}:visible`);
@@ -65406,16 +65422,57 @@ async function submitOneHelpForm(page, form, profileUrl, reason) {
         const inputId = await input.getAttribute("id").catch(() => "") ?? await input.getAttribute("data-testid").catch(() => "") ?? `${sel}_${i}`;
         if (filledInputIds.has(inputId)) continue;
         const currentVal = await input.inputValue().catch(() => "");
-        if (!currentVal) {
-          const fillValue = !urlInputFilled ? profileUrl : "T\xE0i kho\u1EA3n gi\u1EA3 m\u1EA1o, vi ph\u1EA1m \u0111i\u1EC1u kho\u1EA3n Facebook.";
-          await input.click();
-          await input.fill(fillValue);
+        if (currentVal) {
           filledInputIds.add(inputId);
-          if (!urlInputFilled) {
-            urlInputFilled = true;
-            logger2.info({ sel, step, fillValue: profileUrl }, "Filled URL input");
-          }
+          continue;
         }
+        const placeholder = (await input.getAttribute("placeholder").catch(() => "") ?? "").toLowerCase();
+        const name = (await input.getAttribute("name").catch(() => "") ?? "").toLowerCase();
+        const inputType = (await input.getAttribute("type").catch(() => "text") ?? "text").toLowerCase();
+        const ariaLabel = (await input.getAttribute("aria-label").catch(() => "") ?? "").toLowerCase();
+        const labelText = await page.evaluate((el) => {
+          const id = el.id;
+          if (id) {
+            const lbl = document.querySelector(`label[for="${id}"]`);
+            if (lbl) return lbl.textContent?.toLowerCase() ?? "";
+          }
+          const parent = el.closest("label");
+          return parent ? parent.textContent?.toLowerCase() ?? "" : "";
+        }, await input.elementHandle().catch(() => null)).catch(() => "");
+        const hints = `${placeholder} ${name} ${ariaLabel} ${labelText}`;
+        let fillValue;
+        if (inputType === "email" || hints.includes("email") || hints.includes("e-mail")) {
+          fillValue = PLACEHOLDER_EMAIL;
+        } else if (hints.includes("url") || hints.includes("link") || hints.includes("li\xEAn k\u1EBFt") || hints.includes("http") || hints.includes("profile") || hints.includes("trang c\xE1 nh\xE2n") || hints.includes("k\u1EBB m\u1EA1o danh") || hints.includes("impersonat")) {
+          fillValue = profileUrl;
+          urlInputFilled = true;
+        } else if (hints.includes("name") || hints.includes("t\xEAn") || hints.includes("h\u1ECD") || hints.includes("full name") || hints.includes("your name")) {
+          fillValue = PLACEHOLDER_NAME;
+        } else if (sel === "textarea" || hints.includes("additional") || hints.includes("th\xEAm")) {
+          fillValue = "T\xE0i kho\u1EA3n n\xE0y vi ph\u1EA1m \u0111i\u1EC1u kho\u1EA3n Facebook, \u0111ang m\u1EA1o danh ng\u01B0\u1EDDi kh\xE1c.";
+        } else if (!urlInputFilled) {
+          fillValue = profileUrl;
+          urlInputFilled = true;
+        } else {
+          fillValue = "T\xE0i kho\u1EA3n gi\u1EA3 m\u1EA1o, vi ph\u1EA1m \u0111i\u1EC1u kho\u1EA3n Facebook.";
+        }
+        await input.click();
+        await input.fill(fillValue);
+        filledInputIds.add(inputId);
+        logger2.info({ sel, step, hint: hints.trim().slice(0, 60), fillValue: fillValue.slice(0, 60) }, "Filled input");
+      }
+    }
+    const fileInputs = page.locator('input[type="file"]');
+    const fileCount = await fileInputs.count().catch(() => 0);
+    for (let fi = 0; fi < fileCount; fi++) {
+      const fileInput = fileInputs.nth(fi);
+      if (!await fileInput.isVisible({ timeout: 400 }).catch(() => false)) continue;
+      try {
+        await fileInput.setInputFiles(FAKE_ID_PATH);
+        logger2.info({ step, fi }, "Uploaded fake ID placeholder to file input");
+        await page.waitForTimeout(600);
+      } catch (e) {
+        logger2.warn({ step, fi, err: String(e) }, "Could not upload fake ID \u2014 skipping");
       }
     }
     let btnClicked = false;
