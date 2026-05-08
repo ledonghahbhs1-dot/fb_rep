@@ -56,4 +56,4 @@ API server nhận cookie Facebook + prompt, gọi AI và trả về reply. Có t
 
 ## User Preferences
 
-- Sau mỗi thay đổi code, **tự động push lên GitHub** (`ledonghahbhs1-dot/fb_re`) bằng GITHUB_TOKEN mà không cần nhắc nhở.
+- Sau mỗi thay đổi code, **tự động push lên GitHub** (`ledonghahbhs1-dot/fb_rep`) bằng `GITHUB_PERSONAL_ACCESS_TOKEN` mà không cần nhắc nhở.
