@@ -244,77 +244,202 @@ async function checkProfileStatus(page: Page, url: string): Promise<{ status: Ac
 }
 
 // ─── Strategy A: all official help-contact forms ─────────────────────────────
-async function submitOneHelpForm(page: Page, form: HelpForm, profileUrl: string, reason: ReportReason): Promise<{ success: boolean; message: string; screenshot?: string }> {
-  const formUrl = `https://www.facebook.com/help/contact/${form.id}`;
-  await page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(2000);
 
-  if (page.url().includes("login") || page.url().includes("checkpoint"))
+const SUCCESS_WORDS = ["thank","received","submitted","review","we'll review",
+  "cảm ơn","đã nhận","đã gửi","chúng tôi sẽ xem xét","your report","report submitted"];
+
+// Selectors for form action buttons (Next / Continue / Submit / Send)
+const ACTION_BTN_SELS = [
+  'button[type="submit"]',
+  'input[type="submit"]',
+  '[role="button"]:has-text("Submit")',
+  '[role="button"]:has-text("Send")',
+  '[role="button"]:has-text("Continue")',
+  '[role="button"]:has-text("Next")',
+  '[role="button"]:has-text("Tiếp tục")',
+  '[role="button"]:has-text("Gửi")',
+  '[role="button"]:has-text("Tiếp")',
+  'button:has-text("Submit")',
+  'button:has-text("Send")',
+  'button:has-text("Continue")',
+  'button:has-text("Next")',
+];
+
+// URL input selectors, ordered from most-specific to least-specific
+const URL_INPUT_SELS = [
+  'input[placeholder*="link" i]',
+  'input[placeholder*="url" i]',
+  'input[placeholder*="profile" i]',
+  'input[placeholder*="account" i]',
+  'input[placeholder*="http" i]',
+  'input[name*="url" i]',
+  'input[name*="link" i]',
+  'input[type="url"]',
+  'input[type="text"]',
+  'textarea',
+];
+
+function isSuccess(text: string, url: string): boolean {
+  return SUCCESS_WORDS.some(w => text.toLowerCase().includes(w)) ||
+    url.includes("thank") || url.includes("submitted") || url.includes("done");
+}
+
+/**
+ * Submit a single Facebook help-contact form using a multi-step wizard loop.
+ *
+ * Facebook forms are JS-rendered wizards with 2-6 steps:
+ *   Step 1: Radio buttons (What's happening?)
+ *   Step 2: More radios (sub-category) or text input
+ *   Step 3+: Additional fields, description, profile URL
+ *   Final:  Thank-you confirmation page
+ *
+ * We loop up to MAX_STEPS times, at each step:
+ *   1. Check for success → done
+ *   2. Select best-matching radio / [role="radio"] option
+ *   3. Fill any visible text input / textarea with the profile URL
+ *   4. Click the action button (Next / Continue / Submit)
+ *   5. Wait and repeat
+ */
+async function submitOneHelpForm(
+  page: Page,
+  form: HelpForm,
+  profileUrl: string,
+  reason: ReportReason
+): Promise<{ success: boolean; message: string; screenshot?: string }> {
+  const formUrl  = `https://www.facebook.com/help/contact/${form.id}`;
+  const MAX_STEPS = 10;
+
+  logger.info({ formUrl, label: form.label }, "Submitting help form");
+
+  await page.goto(formUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  // Extra wait for JS to hydrate React components
+  await page.waitForTimeout(3000);
+
+  if (page.url().includes("/login") || page.url().includes("checkpoint"))
     return { success: false, message: "Cookie không hợp lệ — chuyển hướng login" };
 
-  const heading = await page.locator("h1, h2, [role='heading']").first().innerText().catch(() => "");
-  const urlSels = ['input[placeholder*="link" i]','input[placeholder*="url" i]','input[placeholder*="profile" i]',
-                   'input[placeholder*="account" i]','input[placeholder*="http" i]','input[name*="url" i]',
-                   'input[name*="link" i]','input[type="url"]','input[type="text"]','textarea'];
+  // Keep track of which URL inputs we already filled so we don't refill on next step
+  const filledInputIds = new Set<string>();
 
-  let filled = false;
-  for (const sel of urlSels) {
-    const inputs = page.locator(sel);
-    const count  = await inputs.count().catch(() => 0);
-    for (let i = 0; i < count; i++) {
-      const input = inputs.nth(i);
-      if (await input.isVisible({ timeout: 600 }).catch(() => false)) {
-        await input.click(); await input.fill(profileUrl); filled = true; break;
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const currentUrl  = page.url();
+    const bodyText    = await page.locator("body").innerText().catch(() => "");
+    const heading     = await page.locator("h1, h2, [role='heading']").first().innerText().catch(() => "");
+
+    logger.info({ step, formId: form.id, heading: heading.slice(0, 80) }, "Wizard step");
+
+    // ── Check for success ──────────────────────────────────────────────────
+    if (isSuccess(bodyText, currentUrl)) {
+      return { success: true, message: `✓ Form #${form.id} gửi thành công (step ${step})` };
+    }
+
+    // ── 1. Select radio / [role="radio"] options ───────────────────────────
+    // Try native <input type="radio"> and ARIA [role="radio"] (React components)
+    const radioTexts = REASON_RADIO_TEXTS[reason];
+    let radioSelected = false;
+
+    // Strategy: find a label or role=radio whose text matches our reason keywords
+    for (const text of radioTexts) {
+      // Try label wrapping native radio
+      const label = page.locator(`label`).filter({ hasText: new RegExp(text, "i") }).first();
+      if (await label.isVisible({ timeout: 500 }).catch(() => false)) {
+        await label.click(); radioSelected = true;
+        logger.info({ text, step }, "Selected radio via label");
+        break;
+      }
+      // Try [role="radio"] with matching text
+      const ariaRadio = page.locator(`[role="radio"]`).filter({ hasText: new RegExp(text, "i") }).first();
+      if (await ariaRadio.isVisible({ timeout: 500 }).catch(() => false)) {
+        await ariaRadio.click(); radioSelected = true;
+        logger.info({ text, step }, "Selected [role=radio]");
+        break;
       }
     }
-    if (filled) break;
-  }
-  if (!filled) {
-    const shot = await dbgShot(page, `form_${form.id}_no_input`);
-    return { success: false, message: `Không tìm thấy ô nhập URL (heading: "${heading}")`, screenshot: shot };
-  }
 
-  await page.waitForTimeout(400);
-  const extra = page.locator('input[type="text"]:visible, textarea:visible');
-  const ec = await extra.count().catch(() => 0);
-  for (let i = 1; i < ec; i++) {
-    const f = extra.nth(i);
-    if (!await f.inputValue().catch(() => "")) await f.fill("Tài khoản giả mạo, vi phạm điều khoản Facebook.");
-  }
-
-  const radios = page.locator('input[type="radio"]:visible');
-  if (await radios.count().catch(() => 0) > 0) {
-    let picked = false;
-    for (const text of REASON_RADIO_TEXTS[reason]) {
-      const label = page.locator(`label:has-text("${text}")`).first();
-      if (await label.isVisible({ timeout: 700 }).catch(() => false)) { await label.click(); picked = true; break; }
+    // Fallback: click first available radio if nothing matched
+    if (!radioSelected) {
+      const firstNative = page.locator('input[type="radio"]:visible').first();
+      const firstAria   = page.locator('[role="radio"]:visible').first();
+      if (await firstNative.isVisible({ timeout: 400 }).catch(() => false)) {
+        await firstNative.click(); radioSelected = true;
+      } else if (await firstAria.isVisible({ timeout: 400 }).catch(() => false)) {
+        await firstAria.click(); radioSelected = true;
+      }
+      if (radioSelected) logger.info({ step }, "Selected first available radio (fallback)");
     }
-    if (!picked) await radios.first().click();
-    await page.waitForTimeout(400);
+
+    if (radioSelected) await page.waitForTimeout(500);
+
+    // ── 2. Fill text inputs / textareas ───────────────────────────────────
+    // Fill the FIRST unfilled visible input with the profile URL,
+    // subsequent inputs get a generic description.
+    let urlInputFilled = false;
+    for (const sel of URL_INPUT_SELS) {
+      const inputs = page.locator(`${sel}:visible`);
+      const count  = await inputs.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const input  = inputs.nth(i);
+        if (!await input.isVisible({ timeout: 400 }).catch(() => false)) continue;
+
+        // Use data-testid or id as a stable key to avoid re-filling
+        const inputId = await input.getAttribute("id").catch(() => "") ??
+                        await input.getAttribute("data-testid").catch(() => "") ??
+                        `${sel}_${i}`;
+        if (filledInputIds.has(inputId)) continue;
+
+        const currentVal = await input.inputValue().catch(() => "");
+        if (!currentVal) {
+          const fillValue = !urlInputFilled ? profileUrl : "Tài khoản giả mạo, vi phạm điều khoản Facebook.";
+          await input.click();
+          await input.fill(fillValue);
+          filledInputIds.add(inputId);
+          if (!urlInputFilled) {
+            urlInputFilled = true;
+            logger.info({ sel, step, fillValue: profileUrl }, "Filled URL input");
+          }
+        }
+      }
+    }
+
+    // ── 3. Click action button (Next / Continue / Submit) ──────────────────
+    let btnClicked = false;
+    for (const sel of ACTION_BTN_SELS) {
+      const btn = page.locator(sel).last(); // use .last() to prefer Submit over Next when both visible
+      if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
+        const btnText = await btn.innerText().catch(() => sel);
+        logger.info({ btnText: btnText.trim().slice(0, 40), step, formId: form.id }, "Clicking action button");
+        await btn.click();
+        btnClicked = true;
+        break;
+      }
+    }
+
+    if (!btnClicked) {
+      // No more buttons — either stuck or done
+      logger.warn({ step, formId: form.id }, "No action button found — checking final state");
+      const finalText = await page.locator("body").innerText().catch(() => "");
+      if (isSuccess(finalText, page.url()))
+        return { success: true, message: `✓ Form #${form.id} gửi thành công (no-btn step ${step})` };
+
+      const shot = await dbgShot(page, `form_${form.id}_stuck_step${step}`);
+      return {
+        success: false,
+        message: `Không tìm thấy nút Next/Submit ở step ${step} (heading: "${heading.slice(0, 60)}")`,
+        screenshot: shot,
+      };
+    }
+
+    // Wait for next step to render
+    await page.waitForTimeout(2500);
   }
 
-  const submitSels = ['button[type="submit"]','input[type="submit"]',
-    'div[role="button"]:has-text("Submit")','div[role="button"]:has-text("Send")',
-    'button:has-text("Submit")','button:has-text("Send")','button:has-text("Gửi")'];
-  let submitted = false;
-  for (const sel of submitSels) {
-    const btn = page.locator(sel).first();
-    if (await btn.isVisible({ timeout: 1200 }).catch(() => false)) { await btn.click(); submitted = true; break; }
-  }
-  if (!submitted) {
-    const shot = await dbgShot(page, `form_${form.id}_no_submit`);
-    return { success: false, message: "Không tìm thấy nút Submit", screenshot: shot };
-  }
+  // Final check after all steps
+  const finalText = await page.locator("body").innerText().catch(() => "");
+  if (isSuccess(finalText, page.url()))
+    return { success: true, message: `✓ Form #${form.id} gửi thành công` };
 
-  await page.waitForTimeout(3000);
-  const afterText = await page.locator("body").innerText().catch(() => "");
-  const afterUrl  = page.url();
-  const okWords   = ["thank","received","submitted","review","cảm ơn","đã nhận","đã gửi","we'll review","chúng tôi sẽ xem xét"];
-  if (okWords.some(w => afterText.toLowerCase().includes(w)) || afterUrl.includes("thank") || afterUrl.includes("submitted"))
-    return { success: true, message: `Gửi thành công form #${form.id}` };
-
-  const shot = await dbgShot(page, `form_${form.id}_no_confirm`);
-  return { success: false, message: `Không có xác nhận sau submit (url: ${afterUrl})`, screenshot: shot };
+  const shot = await dbgShot(page, `form_${form.id}_max_steps`);
+  return { success: false, message: `Đã qua ${MAX_STEPS} bước nhưng không có xác nhận`, screenshot: shot };
 }
 
 async function strategyAllHelpForms(page: Page, profileUrl: string, reason: ReportReason): Promise<{ success: boolean; message: string; screenshot?: string; formResults: FormResult[] }> {
