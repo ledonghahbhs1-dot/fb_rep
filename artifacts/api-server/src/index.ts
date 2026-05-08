@@ -1,93 +1,111 @@
-import app from "./app";
-import { logger } from "./lib/logger";
-import { startBot, canAutoRestart } from "./bot/facebook";
+import express from "express";
+import cors from "cors";
+import pinoHttp from "pino-http";
+import multer from "multer";
+import { pino } from "pino";
+import { z } from "zod";
+import { ReportEngine, StatusCheckEngine } from "./reporter.js";
 
-const rawPort = process.env["PORT"];
+const logger = pino({ level: "info" });
+const app    = express();
+const upload = multer({ storage: multer.memoryStorage() });
 
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
+app.use(pinoHttp({ logger }));
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const port = Number(rawPort);
+const engine      = new ReportEngine();
+const checkEngine = new StatusCheckEngine();
 
-if (Number.isNaN(port) || port <= 0) {
-  throw new Error(`Invalid PORT value: "${rawPort}"`);
-}
+// ─── Validation schemas ───────────────────────────────────────────────────────
+const ReportRequestSchema = z.object({
+  cookies:     z.string().min(1, "Facebook cookies are required"),
+  profileUrls: z.array(z.string().url()).min(1, "At least one profile URL is required"),
+  reason:      z.enum(["fake", "impersonating", "spam", "pretending"]).default("fake"),
+  continuous:  z.boolean().optional().default(false),
+});
 
-// Parse cookie string or JSON array into AppState format for Playwright injection.
-// Accepts: "c_user=xxx; xs=yyy; ..." OR JSON array "[{key,value,...}]"
-function parseFbCookies(raw: string): any[] | null {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("[")) {
-    try {
-      const arr = JSON.parse(trimmed);
-      return Array.isArray(arr) && arr.length > 0 ? arr : null;
-    } catch {
-      return null;
-    }
-  }
-  if (trimmed.includes("=")) {
-    const cookies = trimmed
-      .split(";")
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .map((p) => {
-        const eq = p.indexOf("=");
-        if (eq === -1) return null;
-        return {
-          key: p.slice(0, eq).trim(),
-          value: p.slice(eq + 1).trim(),
-          domain: ".facebook.com",
-          path: "/",
-          hostOnly: false,
-          creation: new Date().toISOString(),
-          lastAccessed: new Date().toISOString(),
-        };
-      })
-      .filter(Boolean);
-    return cookies.length > 0 ? cookies : null;
-  }
-  return null;
-}
+const CheckStatusSchema = z.object({
+  cookies:     z.string().optional(),
+  profileUrls: z.array(z.string().url()).min(1, "At least one profile URL is required"),
+});
 
-app.listen(port, async (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
-
-  logger.info({ port }, "Server listening");
-
-  // ── Priority 1: FB_COOKIES env var (Railway / explicit config) ──────────────
-  const fbCookiesRaw = process.env["FB_COOKIES"];
-  if (fbCookiesRaw) {
-    logger.info("FB_COOKIES env var detected — auto-starting bot");
-    const appState = parseFbCookies(fbCookiesRaw);
-    if (!appState) {
-      logger.error("FB_COOKIES format invalid — expected cookie string or JSON array. Bot NOT started.");
-    } else {
-      try {
-        await startBot({ type: "appstate", appState });
-        logger.info("Bot auto-started from FB_COOKIES ✓");
-      } catch (startErr: any) {
-        logger.error({ err: startErr?.message }, "Auto-start from FB_COOKIES failed");
-      }
-    }
+// ─── Report routes ────────────────────────────────────────────────────────────
+app.post("/api/report", async (req, res) => {
+  const parsed = ReportRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
     return;
   }
-
-  // ── Priority 2: Saved browser state from previous session ────────────────
-  // If user started the bot before and didn't manually stop it, auto-restart.
-  if (canAutoRestart()) {
-    logger.info("Saved session detected — auto-restarting bot from previous session");
-    try {
-      // Pass empty appState — startBot will use saved browser-state.json cookies
-      await startBot({ type: "appstate", appState: [] });
-      logger.info("Bot auto-restarted from saved session ✓");
-    } catch (startErr: any) {
-      logger.warn({ err: startErr?.message }, "Auto-restart from saved session failed — manual login needed");
-    }
-  }
+  const { cookies, profileUrls, reason, continuous } = parsed.data;
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  engine.startJob(jobId, { cookies, profileUrls, reason, continuous });
+  res.json({ jobId, message: "Report job started", total: profileUrls.length, continuous });
 });
+
+app.post("/api/report/upload", upload.single("file"), async (req, res) => {
+  if (!req.file) { res.status(400).json({ error: "No file uploaded" }); return; }
+  const cookies    = req.body.cookies as string;
+  const reason     = (req.body.reason as string) || "fake";
+  const continuous = req.body.continuous === "true";
+  if (!cookies) { res.status(400).json({ error: "cookies field is required" }); return; }
+
+  const content     = req.file.buffer.toString("utf-8");
+  const profileUrls = content.split(/[\r\n,;]+/).map(u => u.trim()).filter(u => u.startsWith("http"));
+  if (profileUrls.length === 0) { res.status(400).json({ error: "No valid URLs found in file" }); return; }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  engine.startJob(jobId, { cookies, profileUrls, reason: reason as any, continuous });
+  res.json({ jobId, message: "Report job started from file", total: profileUrls.length, continuous });
+});
+
+// Stop a continuous job
+app.post("/api/report/:jobId/stop", (req, res) => {
+  const ok = engine.stopJob(req.params.jobId);
+  if (!ok) { res.status(404).json({ error: "Job not found or not running" }); return; }
+  res.json({ message: "Stop signal sent — job will stop after current round" });
+});
+
+app.get("/api/report/:jobId", (req, res) => {
+  const job = engine.getJob(req.params.jobId);
+  if (!job) { res.status(404).json({ error: "Job not found" }); return; }
+  res.json(job);
+});
+
+app.get("/api/jobs", (_req, res) => res.json(engine.getAllJobs()));
+
+app.delete("/api/jobs/:jobId", (req, res) => {
+  engine.removeJob(req.params.jobId);
+  res.json({ message: "Job removed" });
+});
+
+// ─── Status check routes ──────────────────────────────────────────────────────
+app.post("/api/check-status", async (req, res) => {
+  const parsed = CheckStatusSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+    return;
+  }
+  const { cookies, profileUrls } = parsed.data;
+  const jobId = `chk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  checkEngine.startJob(jobId, { cookies, profileUrls });
+  res.json({ jobId, message: "Status check started", total: profileUrls.length });
+});
+
+app.get("/api/check-status/jobs", (_req, res) => res.json(checkEngine.getAllJobs()));
+
+app.get("/api/check-status/:jobId", (req, res) => {
+  const job = checkEngine.getJob(req.params.jobId);
+  if (!job) { res.status(404).json({ error: "Check job not found" }); return; }
+  res.json(job);
+});
+
+app.delete("/api/check-status/:jobId", (req, res) => {
+  checkEngine.removeJob(req.params.jobId);
+  res.json({ message: "Check job removed" });
+});
+
+// ─── Start server ─────────────────────────────────────────────────────────────
+const PORT = Number(process.env.REPORTER_API_PORT ?? 3001);
+app.listen(PORT, "0.0.0.0", () => logger.info({ port: PORT }, "FB Reporter API running"));
