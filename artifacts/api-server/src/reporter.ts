@@ -93,6 +93,7 @@ const ALL_HELP_FORMS: HelpForm[] = [
   { id: "485974059259751",   label: "Báo cáo trang cá nhân",              reasons: ["fake", "impersonating", "pretending", "spam"] },
   { id: "144059062408922",   label: "Báo cáo tài khoản",                  reasons: ["fake", "impersonating", "pretending", "spam"] },
   { id: "228813257197480",   label: "Báo cáo nội dung vi phạm",           reasons: ["fake", "impersonating", "pretending", "spam"] },
+  { id: "516343134409068",   label: "Báo cáo tài khoản vi phạm (mới)",    reasons: ["fake", "impersonating", "pretending", "spam"] },
 ];
 
 const REASON_CREP: Record<ReportReason, string> = { fake: "0", impersonating: "1", spam: "2", pretending: "0" };
